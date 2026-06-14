@@ -712,7 +712,12 @@ async function createSyncRoom() {
       const loc = resp.headers.get('Location') || '';
       syncRoomId = loc.split('/').pop();
     }
-    if (!syncRoomId) throw new Error('No blob ID returned');
+    if (!syncRoomId) {
+      // Last resort: read the response body which might contain the ID
+      const body = await resp.json();
+      syncRoomId = body.id || body.blobId || '';
+    }
+    if (!syncRoomId) throw new Error('No blob ID in response');
     localStorage.setItem('optcg_sync_room', syncRoomId);
     document.getElementById('sync-room-input').value = syncRoomId;
     document.getElementById('sync-create-btn').textContent = 'Copy Code';
@@ -723,7 +728,8 @@ async function createSyncRoom() {
     startSyncPolling();
     toast('Room created! Share the code with your friend');
   } catch(e) {
-    toast('Failed to create room. Try again.');
+    toast('Failed: ' + (e.message || 'Network error. Check console.'));
+    console.error('createSyncRoom error:', e);
   }
 }
 
