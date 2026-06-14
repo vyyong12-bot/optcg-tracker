@@ -705,9 +705,14 @@ async function createSyncRoom() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ w: wishlist, b: buyingList, ts: Date.now() })
     });
-    const location = resp.headers.get('Location');
-    if (!location) throw new Error('No location');
-    syncRoomId = location.split('/').pop();
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    // Try multiple ways to get the blob ID
+    syncRoomId = resp.headers.get('X-jsonblob-id') || '';
+    if (!syncRoomId) {
+      const loc = resp.headers.get('Location') || '';
+      syncRoomId = loc.split('/').pop();
+    }
+    if (!syncRoomId) throw new Error('No blob ID returned');
     localStorage.setItem('optcg_sync_room', syncRoomId);
     document.getElementById('sync-room-input').value = syncRoomId;
     document.getElementById('sync-create-btn').textContent = 'Copy Code';
