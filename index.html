@@ -507,7 +507,8 @@
 
 <div class="sync-bar" id="sync-bar">
   <span class="sync-status" id="sync-status">🔒 Offline</span>
-  <input type="text" class="sync-input" id="sync-room-input" placeholder="Paste room code to join...">
+  <input type="password" class="sync-input" id="sync-token-input" placeholder="GitHub token (once)" style="width:140px">
+  <input type="text" class="sync-input" id="sync-room-input" placeholder="Room code...">
   <button class="sync-btn" id="sync-join-btn">Join</button>
   <button class="sync-btn sync-create" id="sync-create-btn">+ New Room</button>
 </div>
@@ -637,15 +638,24 @@ window.addEventListener('storage', e => {
   }
 });
 
-/* ---- Cloud Sync ---- */
-const SYNC_API = 'https://jsonblob.com/api/jsonBlob';
+/* ---- Cloud Sync via GitHub Gist ---- */
+// Token stored in localStorage only — never committed to source
+let GIST_TOKEN = localStorage.getItem('optcg_gist_token') || '';
 let syncRoomId = localStorage.getItem('optcg_sync_room') || '';
 let syncPollTimer = null;
-let syncDirty = false;
 let syncLastData = '';
 
-function getSyncBlobUrl() {
-  return syncRoomId ? `${SYNC_API}/${syncRoomId}` : '';
+function getGistUrl() {
+  return syncRoomId ? `https://api.github.com/gists/${syncRoomId}` : '';
+}
+
+async function gistRequest(method, body) {
+  const headers = {
+    'Authorization': `token ${GIST_TOKEN}`,
+    'Accept': 'application/vnd.github+json'
+  };
+  if (body) headers['Content-Type'] = 'application/json';
+  return fetch(getGistUrl(), { method, headers, body: body ? JSON.stringify(body) : undefined });
 }
 
 async function syncPush() {
@@ -653,8 +663,8 @@ async function syncPush() {
   const data = JSON.stringify({ w: wishlist, b: buyingList, ts: Date.now() });
   if (data === syncLastData) return;
   try {
-    const resp = await fetch(getSyncBlobUrl(), {
-      method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: data
+    const resp = await gistRequest('PATCH', {
+      files: { 'optcg-lists.json': { content: data } }
     });
     if (resp.ok) {
       syncLastData = data;
@@ -667,16 +677,16 @@ async function syncPush() {
 async function syncPull() {
   if (!syncRoomId) return;
   try {
-    const resp = await fetch(getSyncBlobUrl(), {
-      headers: { 'Cache-Control': 'no-cache' }
-    });
+    const resp = await gistRequest('GET');
     if (!resp.ok) return;
-    const data = await resp.json();
+    const gist = await resp.json();
+    const file = gist.files && gist.files['optcg-lists.json'];
+    if (!file || !file.content) return;
+    const data = JSON.parse(file.content);
     if (!data || !data.w) return;
     const newData = JSON.stringify({ w: data.w, b: data.b });
     if (newData === syncLastData) return;
     syncLastData = newData;
-    // Merge: cloud always wins for cross-device sync
     wishlist = data.w || [];
     buyingList = data.b || [];
     saveList('optcg_wishlist', wishlist);
@@ -690,56 +700,71 @@ async function syncPull() {
 function startSyncPolling() {
   stopSyncPolling();
   if (!syncRoomId) return;
-  syncPull(); // pull immediately
-  syncPollTimer = setInterval(() => {
-    syncPull();   // pull remote changes
-    syncPush();   // push local changes
-  }, 3000);
+  syncPull();
+  syncPollTimer = setInterval(() => { syncPull(); syncPush(); }, 3000);
 }
 
 function stopSyncPolling() {
   if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null; }
 }
 
+function ensureToken() {
+  if (!GIST_TOKEN) {
+    const input = document.getElementById('sync-token-input');
+    GIST_TOKEN = input.value.trim();
+    if (GIST_TOKEN) {
+      localStorage.setItem('optcg_gist_token', GIST_TOKEN);
+      input.value = '';
+      toast('Token saved!');
+    } else {
+      toast('Enter your GitHub token first');
+      return false;
+    }
+  }
+  return true;
+}
+
 async function createSyncRoom() {
+  if (!ensureToken()) return;
   try {
-    // Use text/plain to avoid CORS preflight
-    const body = JSON.stringify({ w: wishlist, b: buyingList, ts: Date.now() });
-    const resp = await fetch(SYNC_API, {
+    const data = JSON.stringify({ w: wishlist, b: buyingList, ts: Date.now() });
+    const resp = await fetch('https://api.github.com/gists', {
       method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: body
+      headers: {
+        'Authorization': `token ${GIST_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        description: 'OPTCG Tracker Sync Room',
+        public: false,
+        files: { 'optcg-lists.json': { content: data } }
+      })
     });
-    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-    // Try multiple ways to get the blob ID
-    syncRoomId = resp.headers.get('X-jsonblob-id') || '';
-    if (!syncRoomId) {
-      const loc = resp.headers.get('Location') || '';
-      syncRoomId = loc.split('/').pop();
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.message || 'HTTP ' + resp.status);
     }
-    if (!syncRoomId) {
-      // Last resort: read the response body which might contain the ID
-      const body = await resp.json();
-      syncRoomId = body.id || body.blobId || '';
-    }
-    if (!syncRoomId) throw new Error('No blob ID in response');
+    const gist = await resp.json();
+    syncRoomId = gist.id;
     localStorage.setItem('optcg_sync_room', syncRoomId);
     document.getElementById('sync-room-input').value = syncRoomId;
     document.getElementById('sync-create-btn').textContent = 'Copy Code';
     document.getElementById('sync-create-btn').classList.add('sync-leave');
     document.getElementById('sync-status').textContent = '🟢 Synced';
     document.getElementById('sync-status').className = 'sync-status connected';
-    syncLastData = '';
+    syncLastData = data;
     startSyncPolling();
     toast('Room created! Share the code with your friend');
   } catch(e) {
-    toast('Failed: ' + (e.message || 'Network error. Check console.'));
-    console.error('createSyncRoom error:', e);
+    toast('Failed: ' + (e.message || 'Network error'));
+    console.error('createSyncRoom:', e);
   }
 }
 
 function joinSyncRoom(code) {
   if (!code) return;
+  if (!ensureToken()) return;
   syncRoomId = code.trim();
   localStorage.setItem('optcg_sync_room', syncRoomId);
   document.getElementById('sync-room-input').value = syncRoomId;
@@ -763,7 +788,6 @@ function leaveSyncRoom() {
   toast('Left sync room');
 }
 
-// Hook into addToList to mark dirty for push
 const origAddToList = addToList;
 addToList = function(listType, cardId) {
   origAddToList(listType, cardId);
@@ -1435,6 +1459,21 @@ async function init() {
   // Event listeners for filters
   document.getElementById('search').addEventListener('input', applyFilters);
   document.getElementById('filter-set').addEventListener('change', applyFilters);
+
+  // Sync token: pre-fill if stored
+  if (GIST_TOKEN) {
+    document.getElementById('sync-token-input').placeholder = 'Token saved ✓';
+  }
+  document.getElementById('sync-token-input').addEventListener('change', () => {
+    const val = document.getElementById('sync-token-input').value.trim();
+    if (val) {
+      GIST_TOKEN = val;
+      localStorage.setItem('optcg_gist_token', GIST_TOKEN);
+      document.getElementById('sync-token-input').value = '';
+      document.getElementById('sync-token-input').placeholder = 'Token saved ✓';
+      toast('Token saved!');
+    }
+  });
 
   // Sync room buttons
   document.getElementById('sync-create-btn').addEventListener('click', () => {
